@@ -1,0 +1,18 @@
+{
+  "session-vault-lifecycle": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 -B scripts/hook.py || python -B scripts/hook.py || py -3 -B scripts/hook.py",
+        "timeout": 10
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 -B scripts/hook.py || python -B scripts/hook.py || py -3 -B scripts/hook.py",
+        "timeout": 10
+      }
+    ]
+  }
+}

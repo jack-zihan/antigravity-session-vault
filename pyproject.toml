@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "antigravity-session-vault"
+version = "0.1.0"
+description = "Native Antigravity Desktop plugin that preserves main conversations forever and auto-archives Swarm/subagent sessions below the 500-session eviction cap."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["antigravity", "sessions", "archive", "vault", "swarm", "subagents"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/jack-zihan/antigravity-session-vault"
+Repository = "https://github.com/jack-zihan/antigravity-session-vault"
+Issues = "https://github.com/jack-zihan/antigravity-session-vault/issues"
+
+[project.scripts]
+session-vault = "session_vault.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["session_vault*"]
