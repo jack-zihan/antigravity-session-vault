@@ -1,8 +1,8 @@
 {
   "name": "antigravity-session-vault",
   "displayName": "Session Vault",
-  "version": "0.1.0",
-  "description": "Preserve Antigravity Desktop main conversations forever while automatically archiving older Swarm and subagent sessions into a searchable cold archive below the 500-session eviction cap.",
+  "version": "0.2.0",
+  "description": "Preserve Antigravity Desktop main conversations forever while curating and archiving Swarm/subagent sessions by importance below the 500-session eviction cap.",
   "logo": "assets/logo.svg",
   "author": {
     "name": "starry",
@@ -23,8 +23,8 @@
     "history"
   ],
   "suggestedPrompts": [
+    "Show my Session Vault subagent trees so we can decide which to keep or archive",
     "Check my Session Vault status and PruneAll(500) risk",
-    "Search archived Swarm and subagent sessions for a topic",
-    "Show my Session Vault retention policy and backup paths"
+    "Search archived Swarm and subagent sessions for a topic"
   ]
 }

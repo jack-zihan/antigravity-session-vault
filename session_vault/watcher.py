@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 import time
 
-from .config import VaultConfig, WatcherSettings, default_config_path, default_home_dir
+from .config import VaultConfig, WatcherSettings, default_config_path, default_home_dir, load_config
 from .platform_ops import (
     InstanceLock,
     find_ls_and_main_agy,
@@ -82,6 +82,7 @@ def run_watch(
     cfg: VaultConfig,
     log: logging.Logger,
     *,
+    config_path: Path | None = None,
     shield_sec: int | None = None,
     backup_sec: int | None = None,
     exit_after_clean: bool = False,
@@ -122,7 +123,14 @@ def run_watch(
                         continue
                     gate_ok, gate_msg = verify_offline_gate(cfg)
                     if gate_ok:
-                        run_clean(cfg, log, skip_gate=True)
+                        active_pol = cfg.retention
+                        try:
+                            resolved_cfg = config_path.expanduser() if config_path is not None else default_config_path()
+                            if resolved_cfg.is_file():
+                                active_pol = load_config(resolved_cfg).retention
+                        except Exception as exc:
+                            log.warning("watch: failed to reload policy from config (%s); using startup policy", exc)
+                        run_clean(cfg, log, policy=active_pol, skip_gate=True)
                         cleaned_while_idle = True
                         if exit_after_clean:
                             log.info("watch: offline clean complete; exiting (--exit-after-clean)")

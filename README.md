@@ -45,16 +45,19 @@ The plugin is structured as a strict, zero-dependency 4-layer package (`session_
 - **Layer 2 (`shield.py`, `archive.py`, `vault.py`)**: Independent retention layers — online `mtime` shield, offline 4-tier smart archival + dual-store cleanup, and incremental WAL-safe root backup, archive search, and offline restore.
 - **Layer 3 (`watcher.py`, `cli.py`, `scripts/hook.py`)**: Event-driven lifecycle watcher (lazy-loads heavy modules only after acquiring its lock), read-only zero-log CLI queries, and a fast-path hook entrypoint that always emits `{}`.
 
-### Smart 4-Tier Retention Policy
+### Importance-First Retention & Conversational Curation
+
+Time alone does not equal importance: a 5-day-old core research Teamwork tree may matter far more than a 2-hour-old throwaway Swarm. Session Vault supports per-root curation right inside chat (`trees` + `policy`) with oldest-first time fallback:
 
 | Tier | Scope | Action |
 |---|---|---|
-| **Priority 0 (Never Archived)** | Main conversations, Side Questions (`conversation_parents` + `annotations/*.pbtxt`), pinned/annotated chats, unindexed new chats, any running/non-idle task, anything touched within 5 min (`recent_touch_guard_sec = 300`) | Always kept in place & backed up incrementally to the Vault |
-| **Priority 1 (Hot Subagents)** | Non-killed (`killed == 0`) subagents of roots active within **2 days**, plus non-killed subagents active within **3 days** | Kept in place unless Priority 0 + Priority 1 alone exceed `target_max` |
-| **Priority 2 (Normal Offload)** | Completed/inactive subagents of roots inactive for **> 2 days** | Losslessly archived oldest-first on exit |
-| **Safety Valve (`target_max = 420`)** | Only if active DBs still exceed **420** (80-slot safety buffer below 500) | Archives the **oldest** `killed == 1` subagents of recent roots first, leaving your most recent Swarm/subagent sessions in place |
+| **Priority 0 (Never Archived)** | Main conversations, Side Questions (`conversation_parents` + `annotations/*.pbtxt`), pinned/annotated chats, unindexed new chats, any running/non-idle task, anything touched within 5 min, and individually pinned `keep_subagents` (restored subagents are auto-pinned here) | Always kept in place; main roots & Side Questions are backed up incrementally to the Vault |
+| **Tier 1 (Explicit Archive)** | Idle/completed subagents of roots tagged in `archive_roots` (`policy archive <id>`) | Archived first on exit to free active slots immediately, regardless of recency |
+| **Tier 2 (Auto Time Fallback)** | Subagents of non-kept (`auto`) roots inactive for **> 2 days** | Losslessly archived oldest-first on exit |
+| **Tier 3 (Safety Valve · `auto`)** | Only if active DBs still exceed **`target_max = 420`** | Archives the oldest `killed == 1`, then oldest idle `killed == 0` subagents of `auto` roots |
+| **Tier 4 (Protected `keep_roots`)** | Subagent trees of important roots tagged in `keep_roots` (`policy keep <id>`) | Kept hot in place regardless of age; only their oldest `killed == 1` subagents overflow if `keep_roots` + Priority 0 alone exceed `target_max` |
 
-Every archived subagent remains **instantly readable online** without restarting Antigravity via `index.jsonl` and the bundled `rules/AGENTS.md` instruction, or can be restored back into the Desktop UI offline via `restore <uuid>`.
+Every archived subagent remains **instantly readable online** without restarting Antigravity via `index.jsonl` and `rules/AGENTS.md`, can be restored offline via `restore <uuid>` (auto-pinned so it is not re-archived on the next quit), or explicitly purged from cold archive via `discard --yes`.
 
 ---
 
@@ -111,7 +114,10 @@ python3 -B -m session_vault config --init   # Windows: python -B -m session_vaul
     "target_max": 420,
     "root_active_days": 2,
     "keep_idle_days": 3,
-    "recent_touch_guard_sec": 300
+    "recent_touch_guard_sec": 300,
+    "keep_roots": [],
+    "archive_roots": [],
+    "keep_subagents": []
   },
   "watcher": {
     "shield_interval_sec": 120,
@@ -131,8 +137,11 @@ Run from the plugin directory (or install optionally with `pip install -e .` to 
 | Command | Safe Online? | Description |
 |---|---|---|
 | `python -B -m session_vault status` | Yes (read-only) | Active DB count, `PruneAll(500)` risk simulation, watcher state, ghost count, vault stats |
+| `python -B -m session_vault trees [--json] [--limit N]` | Yes (read-only) | Group active & archived subagents by root conversation with size and `keep`/`archive`/`auto` tags |
+| `python -B -m session_vault policy [list \| keep \| archive \| auto <id...>] [--subagent]` | Yes | Inspect or update per-root/subagent retention rules (hot-reloaded by watcher before next offline clean) |
 | `python -B -m session_vault search [query] [--root <id>] [--limit N]` | Yes (read-only) | Search archived subagents via `index.jsonl` and print direct `transcript.jsonl` paths |
 | `python -B -m session_vault clean --dry-run [--verbose] [--target-max N] [--root-active-days N] [--keep-idle-days N]` | Yes (read-only) | Preview a concise summary of what the next offline clean will archive and purge (`--verbose` includes full `offload_ids`) |
+| `python -B -m session_vault discard [--root <id> \| <cid...>] [--yes]` | Yes (`--yes` deletes archive) | Preview or explicitly delete unwanted cold-archived subagents (never touches live DBs or Root Vault) |
 | `python -B -m session_vault shield` | Yes | Run Layer 1 online `mtime` priority shield immediately |
 | `python -B -m session_vault backup` | Yes | Run Layer 3 WAL-safe incremental backup of all protected roots |
 | `python -B -m session_vault ensure [--force]` | Yes | Ensure the detached lifecycle watcher is running (`--force` spawns even if Desktop LS is offline) |

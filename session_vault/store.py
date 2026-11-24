@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import datetime
 import itertools
@@ -16,9 +17,9 @@ import stat
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Iterable
 
-from .config import VaultConfig
+from .config import RetentionPolicy, VaultConfig, default_config_path, validate_cid
 from .platform_ops import has_main_antigravity_process, is_file_unshared
 
 PRUNE_CAP = 500
@@ -90,6 +91,13 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
+def save_config(cfg: VaultConfig, config_path: Path | None = None) -> Path:
+    """Atomically persist VaultConfig to config.json."""
+    target = (config_path or default_config_path()).expanduser()
+    atomic_write_bytes(target, (json.dumps(cfg.to_dict(), ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+    return target
+
+
 def read_index_entries(index_path: Path, *, log: logging.Logger | None = None) -> list[dict[str, Any]]:
     """Read subagent index.jsonl entries, skipping malformed lines with an optional warning."""
     if not index_path.is_file():
@@ -152,7 +160,7 @@ def snapshot_meta_files(cfg: VaultConfig, tag: str = "meta") -> Path:
     return snap_dir
 
 
-# --- Classification & Offline Gate ---
+# --- Classification, Tree Summaries & Offline Gate ---
 
 
 def parse_iso_ts(raw: str) -> float:
@@ -287,6 +295,83 @@ def resolve_root_id(state: StateSnapshot, cid: str) -> str:
         seen.add(cur)
         cur = state.summaries[cur].parent_id
     return cur
+
+
+def resolve_id_prefix(raw_id: str, candidates: Iterable[str]) -> str:
+    """Resolve an exact ID or unambiguous prefix against known candidates."""
+    needle = validate_cid(raw_id, "conversation ID")
+    pool = set(candidates)
+    if needle in pool:
+        return needle
+    matches = sorted(c for c in pool if c.lower().startswith(needle.lower()))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous ID prefix {needle!r}; matches: {', '.join(m[:12] for m in matches[:5])}")
+    return needle
+
+
+def summarize_trees(cfg: VaultConfig, state: StateSnapshot | None = None) -> list[dict[str, object]]:
+    """Summarize active & archived subagent counts grouped by root conversation for curation."""
+    snap = state or load_state(cfg)
+    pol = cfg.retention
+    keep_set = set(pol.keep_roots)
+    arch_set = set(pol.archive_roots)
+
+    active_stats: dict[str, dict[str, int]] = collections.defaultdict(
+        lambda: {"total": 0, "killed": 0, "alive": 0, "bytes": 0}
+    )
+    for cid, row in snap.subagents.items():
+        rid = resolve_root_id(snap, cid)
+        st = active_stats[rid]
+        st["total"] += 1
+        st["killed" if row.killed == 1 else "alive"] += 1
+        try:
+            st["bytes"] += snap.disk_dbs[cid].stat().st_size
+        except OSError:
+            pass
+
+    archived_counts: dict[str, int] = collections.Counter()
+    archived_titles: dict[str, str] = {}
+    for rec in read_index_entries(cfg.subagent_index_path):
+        rid = str(rec.get("root_id") or "")
+        if not rid:
+            continue
+        archived_counts[rid] += 1
+        if rec.get("root_title") and rid not in archived_titles:
+            archived_titles[rid] = str(rec["root_title"])
+
+    all_rids = set(active_stats) | set(archived_counts) | keep_set | arch_set
+    rows: list[dict[str, object]] = []
+    for rid in all_rids:
+        rrow = snap.summaries.get(rid)
+        st = active_stats.get(rid, {"total": 0, "killed": 0, "alive": 0, "bytes": 0})
+        tag = "keep" if rid in keep_set else ("archive" if rid in arch_set else "auto")
+        title = (rrow.title if rrow and rrow.title else archived_titles.get(rid, ""))
+        rows.append(
+            {
+                "root_id": rid,
+                "title": title,
+                "policy": tag,
+                "pinned": rid in snap.pinned_ids,
+                "root_on_disk": rid in snap.disk_dbs,
+                "last_modified_time": rrow.last_modified_time if rrow else "",
+                "active_subagents": st["total"],
+                "killed": st["killed"],
+                "alive": st["alive"],
+                "active_bytes": st["bytes"],
+                "archived_subagents": archived_counts.get(rid, 0),
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            int(r["active_subagents"]),
+            int(r["archived_subagents"]),
+            str(r["last_modified_time"]),
+        ),
+        reverse=True,
+    )
+    return rows
 
 
 def simulate_prune500(state: StateSnapshot) -> tuple[int, list[str]]:

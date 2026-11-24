@@ -1,7 +1,8 @@
-"""Layer 3: Online WAL-safe incremental root vault backup, archive search, and offline restore."""
+"""Layer 3: Online WAL-safe root backup, archive search, explicit discard, and offline restore."""
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import json
 import logging
@@ -11,7 +12,7 @@ import shutil
 import sqlite3
 import time
 
-from .config import VaultConfig
+from .config import VaultConfig, validate_cid
 from .platform_ops import InstanceLock
 from .proto import upsert_summary_proto
 from .store import (
@@ -21,6 +22,7 @@ from .store import (
     load_state,
     read_index_entries,
     rewrite_index_entries,
+    save_config,
     snapshot_meta_files,
     verify_offline_gate,
 )
@@ -75,6 +77,17 @@ def _write_if_changed(dst: Path, data: bytes) -> bool:
         pass
     atomic_write_bytes(dst, data)
     return True
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for fn in files:
+            try:
+                total += (Path(root) / fn).stat().st_size
+            except OSError:
+                continue
+    return total
 
 
 def _backup_db_file(db_path: Path, dest_db: Path, cid: str) -> None:
@@ -222,6 +235,72 @@ def search_archive(
     return hits
 
 
+def discard_archived(
+    cfg: VaultConfig,
+    *,
+    root_id: str = "",
+    cids: tuple[str, ...] = (),
+    confirm: bool = False,
+    log: logging.Logger | None = None,
+) -> dict[str, object]:
+    """Explicitly discard unwanted archived subagents (never touches active DBs or Root Vault)."""
+    if not root_id and not cids:
+        raise ValueError("Specify --root <id> or one or more archived subagent UUIDs to discard")
+
+    rid = root_id.strip().lower()
+    explicit_ids = {validate_cid(c, "archived subagent ID") for c in cids}
+    entries = read_index_entries(cfg.subagent_index_path, log=log)
+    targets: set[str] = set()
+    for rec in entries:
+        cid = str(rec.get("cid") or "")
+        if not cid:
+            continue
+        if rid and str(rec.get("root_id") or "").lower().startswith(rid):
+            targets.add(cid)
+        if cid in explicit_ids:
+            targets.add(cid)
+    # Also match archived directories explicitly named even if absent from index.jsonl.
+    for cid in explicit_ids:
+        if (cfg.subagent_archive_dir / cid).is_dir():
+            targets.add(cid)
+
+    target_dirs = sorted(
+        (cfg.subagent_archive_dir / cid for cid in targets if (cfg.subagent_archive_dir / cid).is_dir()),
+        key=lambda p: p.name,
+    )
+    total_bytes = sum(_dir_size_bytes(d) for d in target_dirs)
+
+    if not confirm:
+        return {
+            "status": "dry_run",
+            "matched_count": len(target_dirs),
+            "reclaim_bytes": total_bytes,
+            "cids": [d.name for d in target_dirs],
+        }
+
+    with InstanceLock("op", cfg.lock_dir) as locked:
+        if not locked:
+            raise RuntimeError("Another session-vault operation is already in progress")
+        removed: set[str] = set()
+        for d in target_dirs:
+            if d.resolve().parent != cfg.subagent_archive_dir.resolve():
+                raise ValueError(f"Refusing to delete outside subagent archive: {d}")
+            shutil.rmtree(d)
+            removed.add(d.name)
+        if removed and cfg.subagent_index_path.is_file():
+            kept = [e for e in read_index_entries(cfg.subagent_index_path, log=log) if str(e.get("cid")) not in removed]
+            rewrite_index_entries(cfg.subagent_index_path, kept)
+
+    res: dict[str, object] = {
+        "status": "discarded",
+        "removed_count": len(removed),
+        "reclaimed_bytes": total_bytes,
+    }
+    if log is not None:
+        log.info("discard: %s", res)
+    return res
+
+
 def count_restorable(cfg: VaultConfig) -> dict[str, int]:
     """Fast directory-only count of restorable vault roots and archived subagents."""
     counts: dict[str, int] = {}
@@ -271,23 +350,16 @@ def list_restorable(cfg: VaultConfig) -> dict[str, list[dict[str, object]]]:
     return result
 
 
-def _validate_cid(cid: str) -> str:
-    if (
-        not isinstance(cid, str)
-        or not cid
-        or cid.strip() != cid
-        or cid in (".", "..")
-        or ".." in cid
-        or any(ch in cid for ch in ("/", "\\", "\x00", ":"))
-        or Path(cid).name != cid
-    ):
-        raise ValueError(f"Invalid conversation ID: {cid!r}")
-    return cid
-
-
-def run_restore(cfg: VaultConfig, cid: str, log: logging.Logger) -> dict[str, object]:
+def run_restore(
+    cfg: VaultConfig,
+    cid: str,
+    log: logging.Logger,
+    *,
+    config_path: Path | None = None,
+    pin_subagent: bool = True,
+) -> dict[str, object]:
     """Restore a vaulted root or archived subagent back into Antigravity Desktop (offline only)."""
-    _validate_cid(cid)
+    validate_cid(cid)
     candidates = [cfg.vault_roots_dir / cid, cfg.subagent_archive_dir / cid]
     for cand in candidates:
         if cand.resolve().parent != cand.parent.resolve():
@@ -317,7 +389,8 @@ def run_restore(cfg: VaultConfig, cid: str, log: logging.Logger) -> dict[str, ob
         db_dst = cfg.conv_dir / db_src.name
         shutil.copy2(db_src, db_dst)
         os.utime(db_dst, (now, now))
-        if src.parent == cfg.subagent_archive_dir and db_src.suffix == ".db":
+        is_subagent = src.parent == cfg.subagent_archive_dir
+        if is_subagent and db_src.suffix == ".db":
             companion_pb = src / f"{cid}.pb"
             if companion_pb.is_file():
                 pb_dst = cfg.conv_dir / companion_pb.name
@@ -354,11 +427,20 @@ def run_restore(cfg: VaultConfig, cid: str, log: logging.Logger) -> dict[str, ob
             atomic_write_bytes(cfg.summary_pb, updated)
             proto_updated = True
 
-        if src.parent == cfg.subagent_archive_dir and cfg.subagent_index_path.is_file():
-            entries = read_index_entries(cfg.subagent_index_path, log=log)
-            kept = [e for e in entries if str(e.get("cid")) != cid]
-            if len(kept) != len(entries):
-                rewrite_index_entries(cfg.subagent_index_path, kept)
+        pinned_in_policy = False
+        if is_subagent:
+            if cfg.subagent_index_path.is_file():
+                entries = read_index_entries(cfg.subagent_index_path, log=log)
+                kept = [e for e in entries if str(e.get("cid")) != cid]
+                if len(kept) != len(entries):
+                    rewrite_index_entries(cfg.subagent_index_path, kept)
+            # Auto-pin restored subagent in keep_subagents so the next offline clean won't immediately re-archive it.
+            if pin_subagent and cid not in cfg.retention.keep_subagents:
+                new_pol = dataclasses.replace(
+                    cfg.retention, keep_subagents=(*cfg.retention.keep_subagents, cid)
+                )
+                save_config(dataclasses.replace(cfg, retention=new_pol), config_path)
+                pinned_in_policy = True
 
         res = {
             "status": "restored",
@@ -366,6 +448,7 @@ def run_restore(cfg: VaultConfig, cid: str, log: logging.Logger) -> dict[str, ob
             "source": str(src),
             "meta_backup": str(snap_dir),
             "proto_updated": proto_updated,
+            "pinned_in_policy": pinned_in_policy,
         }
         log.info("restore: %s", res)
         return res

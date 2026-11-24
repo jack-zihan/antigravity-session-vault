@@ -1,70 +1,54 @@
 ---
 name: session-vault
-description: Inspect Antigravity Session Vault status, search archived Swarm and subagent sessions online, configure retention thresholds or vault paths, and restore vaulted or archived conversations offline. Use when the user asks about missing chats, the 500 conversation cap, archived subagents, vault backups, or restoring old sessions.
+description: Inspect Antigravity Session Vault status, review subagent trees per main conversation, curate keep/archive retention rules by importance, search or discard cold archives online, and restore vaulted or archived conversations offline. Use when the user asks about missing chats, the 500 conversation cap, keeping important Swarm/Teamwork trees, archiving or discarding old subagents, or restoring sessions.
 license: MIT
 ---
 
 # Session Vault
 
-Manage Antigravity Desktop's conversation retention, cold subagent archive, and incremental root vault.
+Manage Antigravity Desktop's conversation retention, importance-based subagent curation, cold archive, and incremental root vault.
 
 ## When to Use
 
-- Checking active conversation count vs. Antigravity Desktop's hardcoded `PruneAll(500)` cap.
-- Checking whether the lifecycle watcher is active or previewing what the next offline clean will archive.
-- Searching archived Swarm/subagent sessions and reading their transcripts directly (online, no restart required).
-- Configuring retention thresholds (`target_max`, `root_active_days`, `keep_idle_days`, `recent_touch_guard_sec`) or custom `archive_dir` / `vault_dir` / `lock_dir` / `log_file` paths.
-- Restoring a vaulted main conversation or archived subagent back into the Desktop sidebar (requires Desktop to be closed).
+- Auditing which main conversations hold the most Swarm/subagent sessions (`trees`) and curating which trees to keep in place vs. archive first (`policy`).
+- Checking active conversation count vs. Antigravity Desktop's hardcoded `PruneAll(500)` cap (`status`, `clean --dry-run`).
+- Searching archived Swarm/subagent sessions and reading their transcripts directly online (`search`).
+- Explicitly discarding unwanted cold-archived subagents to reclaim disk space (`discard`).
+- Restoring a vaulted main conversation or archived subagent back into Desktop offline (`restore`).
 
-## How to Run Commands
+## Conversational Curation Workflow
 
-All commands use Python 3.10+ standard library only (zero third-party dependencies). Run them with the plugin directory as working directory (or `PYTHONPATH` pointing to the plugin directory, typically `~/.gemini/config/plugins/antigravity-session-vault`). Global overrides (`--config <path>`, `--data-dir <path>`, `--archive-dir <path>`, `--vault-dir <path>`, `--version`, or `SESSION_VAULT_CONFIG` env var) are supported across all subcommands:
+When the user wants to decide which Swarm/Teamwork trees to keep vs. archive:
+1. Run `python -B -m session_vault trees` (read-only) to show each root conversation's active/archived subagent count, size, last active date, and current tag (`keep` / `archive` / `auto`).
+2. Review the table with the user and apply their choices with 8-char ID prefixes:
+   - `python -B -m session_vault policy keep <root_id...>` — keep this root's subagent tree hot in place (overrides the 2-day timeout; only earliest `killed=1` overflow if `keep_roots` alone exceed `target_max`).
+   - `python -B -m session_vault policy archive <root_id...>` — offload this root's idle/completed subagents first on exit.
+   - `python -B -m session_vault policy auto <id...>` — revert back to default time-based rules.
+   - `python -B -m session_vault policy keep --subagent <cid>` — lock an individual subagent in place.
+3. Verify the updated plan with `python -B -m session_vault clean --dry-run`. The running watcher automatically hot-reloads `config.json` before offline clean.
+
+## Command Reference
+
+Run with the plugin directory as working directory (`~/.gemini/config/plugins/antigravity-session-vault`; use `python3` on macOS/Linux, `python` on Windows). Global flags: `--config`, `--data-dir`, `--archive-dir`, `--vault-dir`, `--version`.
 
 ```bash
-# On macOS / Linux use python3; on Windows use python
 python -B -m session_vault status
-python -B -m session_vault search "<keyword>" --limit 20
-python -B -m session_vault search --root <root-uuid-prefix>
+python -B -m session_vault trees [--json] [--limit 30]
+python -B -m session_vault policy [list | keep <id...> | archive <id...> | auto <id...>] [--subagent]
+python -B -m session_vault search "<keyword>" [--root <prefix>] [--limit 20]
 python -B -m session_vault clean --dry-run [--verbose]
+python -B -m session_vault discard [--root <prefix> | <cid...>] [--yes]
 python -B -m session_vault shield
 python -B -m session_vault backup
 python -B -m session_vault ensure [--force]
-python -B -m session_vault watch [--shield-sec 120] [--backup-sec 1800] [--exit-after-clean]
 python -B -m session_vault clean [--target-max 420] [--root-active-days 2] [--keep-idle-days 3]
 python -B -m session_vault restore --list
-python -B -m session_vault restore <uuid>
-python -B -m session_vault config
-python -B -m session_vault config --init
+python -B -m session_vault restore <uuid> [--no-pin]
+python -B -m session_vault config [--init]
 ```
 
 ## Safe Online vs. Offline Operations
 
-- **Read-only (safe online, zero log-file/dir side effects)**: `status`, `search`, `clean --dry-run` (uses `plan_clean` with no `InstanceLock` or offline gate), `restore --list` (or bare `restore`), `config` (without `--init`).
-- **Online mutating / daemon**: `shield`, `backup`, `ensure`, `watch`, `config --init` (atomic write).
-- **Offline only (Desktop must be fully closed)**: `clean` (without `--dry-run`) and `restore <uuid>`. Both acquire `InstanceLock("op", lock_dir)`, enforce a fail-closed process + file-lock gate, and automatically snapshot `conversation_summaries.db` (plus `-wal` and `-shm`) and `agyhub_summaries_proto.pb` before editing. `restore <uuid>` also enforces the `< 480` active DB safety guard, rejects invalid/path-traversal `cid` values, and keeps root `chapter_titles/<cid>.pb` separate from subagent companion `conversations/<cid>.pb`.
-
-## Configuration
-
-User overrides live in `~/.gemini/antigravity-session-vault/config.json` (or `SESSION_VAULT_CONFIG`; run `python -B -m session_vault config --init` to generate a starter file):
-
-```json
-{
-  "data_dir": "~/.gemini/antigravity",
-  "archive_dir": "~/.gemini/antigravity-session-vault/archive",
-  "vault_dir": "~/.gemini/antigravity-session-vault/vault",
-  "log_file": "~/.gemini/antigravity-session-vault/session-vault.log",
-  "lock_dir": "~/.gemini/antigravity-session-vault/locks",
-  "retention": {
-    "target_max": 420,
-    "root_active_days": 2,
-    "keep_idle_days": 3,
-    "recent_touch_guard_sec": 300
-  },
-  "watcher": {
-    "shield_interval_sec": 120,
-    "backup_interval_sec": 1800
-  }
-}
-```
-
-`load_config` applies Fail-Fast validation on startup: rejecting booleans in integer fields, out-of-range thresholds, non-object sections, and empty path values while preserving `_sec` timing keys.
+- **Read-only (safe online, zero log side effects)**: `status`, `trees`, `policy` (without write action), `search`, `clean --dry-run`, `discard` (without `--yes`), `restore --list`, `config` (without `--init`).
+- **Online mutating**: `policy keep|archive|auto`, `discard --yes` (deletes ONLY from cold `<archive_dir>/subagents/`, never live Desktop DBs or Root Vault), `shield`, `backup`, `ensure`, `watch`, `config --init`.
+- **Offline only (Desktop must be closed)**: `clean` and `restore <uuid>`. Restored subagents are automatically pinned in `keep_subagents` (unless `--no-pin` is passed) so they are not re-archived on the next quit.

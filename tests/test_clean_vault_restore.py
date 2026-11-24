@@ -15,7 +15,14 @@ from session_vault.archive import _move_path, plan_clean, run_clean
 from session_vault.config import RetentionPolicy, VaultConfig, load_config
 from session_vault.proto import encode_field1_entry, extract_map_key, iter_proto_fields
 from session_vault.store import CLI_SOURCE
-from session_vault.vault import count_restorable, list_restorable, run_backup, run_restore, search_archive
+from session_vault.vault import (
+    count_restorable,
+    discard_archived,
+    list_restorable,
+    run_backup,
+    run_restore,
+    search_archive,
+)
 from tests.helpers import iso_ago, make_summary_db
 
 
@@ -122,14 +129,28 @@ class TestCleanVaultRestore(unittest.TestCase):
         self.assertEqual(search_archive(self.cfg, "research-worker", limit=0), [])
         self.assertEqual(count_restorable(self.cfg), {"vault_roots": 1, "archived_subagents": 1})
 
-        # 5. Offline restore of subagent keeps companion .pb in conversations/ (not chapter_titles/).
+        # 5. Offline restore of subagent auto-pins in keep_subagents and keeps companion .pb in conversations/.
+        cfg_file = self.root / "restore_cfg.json"
         with mock.patch("session_vault.vault.verify_offline_gate", return_value=(True, "ok")):
-            rres = run_restore(self.cfg, ids["sub_old"], self.log)
-        self.assertEqual((rres["status"], rres["proto_updated"]), ("restored", True))
+            rres = run_restore(self.cfg, ids["sub_old"], self.log, config_path=cfg_file)
+        self.assertEqual((rres["status"], rres["proto_updated"], rres["pinned_in_policy"]), ("restored", True, True))
         self.assertTrue((self.cfg.conv_dir / f"{ids['sub_old']}.db").is_file())
         self.assertTrue((self.cfg.conv_dir / f"{ids['sub_old']}.pb").is_file())
         self.assertFalse((self.cfg.chap_dir / f"{ids['sub_old']}.pb").exists())
         self.assertEqual(search_archive(self.cfg, "research-worker"), [])
+        reloaded = load_config(cfg_file)
+        self.assertIn(ids["sub_old"], reloaded.retention.keep_subagents)
+        # Because restored subagent is auto-pinned, next clean will NOT immediately re-archive it.
+        self.assertEqual(plan_clean(reloaded)["offload_count"], 0)
+
+        # 6. Explicit discard removes ONLY cold archive folder (never live DB or root vault).
+        dry_disc = discard_archived(self.cfg, cids=(ids["sub_old"],), confirm=False)
+        self.assertEqual((dry_disc["status"], dry_disc["matched_count"]), ("dry_run", 1))
+        done_disc = discard_archived(self.cfg, cids=(ids["sub_old"],), confirm=True, log=self.log)
+        self.assertEqual((done_disc["status"], done_disc["removed_count"]), ("discarded", 1))
+        self.assertFalse((self.cfg.subagent_archive_dir / ids["sub_old"]).exists())
+        self.assertTrue((self.cfg.conv_dir / f"{ids['sub_old']}.db").is_file())
+        self.assertTrue((self.cfg.vault_roots_dir / ids["root"]).is_dir())
 
     def test_clean_rollback_exdev_and_restore_safety_guards(self) -> None:
         ids = self._populate_fixture()

@@ -21,6 +21,33 @@ def _validate_int(val: object, name: str, *, min_value: int) -> int:
     return val
 
 
+def validate_cid(cid: object, label: str = "conversation ID") -> str:
+    if (
+        not isinstance(cid, str)
+        or not cid
+        or cid.strip() != cid
+        or cid in (".", "..")
+        or ".." in cid
+        or any(ch in cid for ch in ("/", "\\", "\x00", ":"))
+        or Path(cid).name != cid
+    ):
+        raise ValueError(f"Invalid {label}: {cid!r}")
+    return cid
+
+
+def _validate_id_tuple(raw: object, name: str) -> tuple[str, ...]:
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"Config '{name}' must be a list of conversation IDs, got {type(raw).__name__}")
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in raw:
+        cid = validate_cid(item, name)
+        if cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return tuple(out)
+
+
 def _require_path(value: object, label: str) -> Path:
     if isinstance(value, str):
         if not value.strip():
@@ -48,12 +75,35 @@ class RetentionPolicy:
     root_active_days: int = 2
     keep_idle_days: int = 3
     recent_touch_guard_sec: int = 300
+    keep_roots: tuple[str, ...] = ()
+    archive_roots: tuple[str, ...] = ()
+    keep_subagents: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_int(self.target_max, "retention.target_max", min_value=1)
         _validate_int(self.root_active_days, "retention.root_active_days", min_value=0)
         _validate_int(self.keep_idle_days, "retention.keep_idle_days", min_value=0)
         _validate_int(self.recent_touch_guard_sec, "retention.recent_touch_guard_sec", min_value=0)
+        keep_r = _validate_id_tuple(self.keep_roots, "retention.keep_roots")
+        arch_r = _validate_id_tuple(self.archive_roots, "retention.archive_roots")
+        keep_s = _validate_id_tuple(self.keep_subagents, "retention.keep_subagents")
+        conflict = set(keep_r) & set(arch_r)
+        if conflict:
+            raise ValueError(f"Roots cannot be in both keep_roots and archive_roots: {sorted(conflict)}")
+        object.__setattr__(self, "keep_roots", keep_r)
+        object.__setattr__(self, "archive_roots", arch_r)
+        object.__setattr__(self, "keep_subagents", keep_s)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "target_max": self.target_max,
+            "root_active_days": self.root_active_days,
+            "keep_idle_days": self.keep_idle_days,
+            "recent_touch_guard_sec": self.recent_touch_guard_sec,
+            "keep_roots": list(self.keep_roots),
+            "archive_roots": list(self.archive_roots),
+            "keep_subagents": list(self.keep_subagents),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,7 +169,7 @@ class VaultConfig:
             "vault_dir": str(self.vault_dir),
             "log_file": str(self.log_file),
             "lock_dir": str(self.lock_dir),
-            "retention": dataclasses.asdict(self.retention),
+            "retention": self.retention.to_dict(),
             "watcher": dataclasses.asdict(self.watcher),
         }
 
@@ -172,6 +222,9 @@ def load_config(
             root_active_days=ret_raw.get("root_active_days", 2),
             keep_idle_days=ret_raw.get("keep_idle_days", 3),
             recent_touch_guard_sec=ret_raw.get("recent_touch_guard_sec", 300),
+            keep_roots=ret_raw.get("keep_roots", ()),
+            archive_roots=ret_raw.get("archive_roots", ()),
+            keep_subagents=ret_raw.get("keep_subagents", ()),
         ),
         watcher=WatcherSettings(
             shield_interval_sec=wat_raw.get("shield_interval_sec", 120),

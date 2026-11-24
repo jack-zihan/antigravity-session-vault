@@ -143,15 +143,38 @@ class TestStoreAndPolicy(unittest.TestCase):
         make_summary_db(self.cfg.summary_db, rows)
         state = load_state(self.cfg)
 
-        t1, t2, t3 = select_offload_subagents(state, RetentionPolicy(target_max=5, root_active_days=2, keep_idle_days=3))
-        self.assertEqual(t1, ["sub-inactive-old", "sub-inactive-new"])
-        self.assertEqual(t2, ["sub-killed-1-oldest", "sub-killed-2-mid"])
-        self.assertEqual(t3, [])
+        sel = select_offload_subagents(state, RetentionPolicy(target_max=5, root_active_days=2, keep_idle_days=3))
+        self.assertEqual(sel.auto_normal, ["sub-inactive-old", "sub-inactive-new"])
+        self.assertEqual(sel.auto_overflow_killed, ["sub-killed-1-oldest", "sub-killed-2-mid"])
+        self.assertEqual(sel.auto_overflow_alive, [])
 
-        # Tighter target_max=3 spills into tier-3 alive idle without touching running/roots.
-        _, t2b, t3b = select_offload_subagents(state, RetentionPolicy(target_max=3, root_active_days=2, keep_idle_days=3))
-        self.assertEqual(t2b, ["sub-killed-1-oldest", "sub-killed-2-mid", "sub-killed-3-newest"])
-        self.assertEqual(t3b, ["sub-alive-active"])
+        # Tighter target_max=3 spills into auto alive idle without touching running/roots.
+        sel_b = select_offload_subagents(state, RetentionPolicy(target_max=3, root_active_days=2, keep_idle_days=3))
+        self.assertEqual(sel_b.auto_overflow_killed, ["sub-killed-1-oldest", "sub-killed-2-mid", "sub-killed-3-newest"])
+        self.assertEqual(sel_b.auto_overflow_alive, ["sub-alive-active"])
+
+        # Importance-first: archive_roots offloads fresh active root first; keep_roots protects 5-day-old root;
+        # keep_subagents never offloads even when target_max is tight.
+        pol_imp = RetentionPolicy(
+            target_max=5,
+            root_active_days=2,
+            keep_idle_days=3,
+            keep_roots=("root-old",),
+            archive_roots=("root-active",),
+            keep_subagents=("sub-killed-3-newest",),
+        )
+        sel_imp = select_offload_subagents(state, pol_imp)
+        self.assertEqual(
+            sel_imp.explicit_archive,
+            ["sub-killed-1-oldest", "sub-killed-2-mid", "sub-alive-active"],
+        )
+        self.assertNotIn("sub-killed-3-newest", sel_imp.all_ids)
+        self.assertEqual(sel_imp.keep_overflow, ["sub-inactive-old"])
+        self.assertNotIn("sub-inactive-new", sel_imp.all_ids)
+
+        # Overlap between keep_roots and archive_roots must fail fast.
+        with self.assertRaises(ValueError):
+            RetentionPolicy(keep_roots=("root-old",), archive_roots=("root-old",))
 
     def test_parse_iso_ts_and_offline_gate(self) -> None:
         self.assertEqual(parse_iso_ts(""), 0.0)

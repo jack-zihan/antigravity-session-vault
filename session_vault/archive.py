@@ -1,4 +1,4 @@
-"""Layer 2: Offline smart 4-tier subagent archival + index.jsonl + dual-store ghost cleanup."""
+"""Layer 2: Offline importance-first subagent archival + index.jsonl + dual-store ghost cleanup."""
 
 from __future__ import annotations
 
@@ -30,25 +30,54 @@ from .store import (
 )
 
 
+@dataclasses.dataclass(frozen=True)
+class OffloadSelection:
+    """Ordered buckets of subagent IDs selected for offline archival."""
+
+    explicit_archive: list[str]
+    auto_normal: list[str]
+    auto_overflow_killed: list[str]
+    auto_overflow_alive: list[str]
+    keep_overflow: list[str]
+
+    @property
+    def all_ids(self) -> list[str]:
+        return (
+            self.explicit_archive
+            + self.auto_normal
+            + self.auto_overflow_killed
+            + self.auto_overflow_alive
+            + self.keep_overflow
+        )
+
+
 def select_offload_subagents(
     state: StateSnapshot,
     policy: RetentionPolicy | None = None,
-) -> tuple[list[str], list[str], list[str]]:
-    """Select subagents to archive using strict safety priority tiers (oldest-first within each tier).
+) -> OffloadSelection:
+    """Select subagents to archive: user importance rules first, oldest-first time fallback.
 
     Never offloads:
       - Protected main conversations, side questions, pinned/annotated chats, unindexed DBs
       - Any running / non-idle subagent or one modified within recent_touch_guard_sec
+      - Any subagent explicitly listed in policy.keep_subagents
 
-    Offload tiers:
-      1. Normal offload: subagents of inactive roots (>root_active_days) that are killed or >keep_idle_days old
-      2. Safety-valve tier A (only if remaining > target_max): oldest killed=1 subagents of active roots
-      3. Safety-valve tier B (only if still > target_max): oldest idle killed=0 subagents
+    Offload priority (oldest-first within each tier):
+      1. Explicit archive: idle/killed subagents of roots in policy.archive_roots
+      2. Auto normal: subagents of inactive non-kept roots (>root_active_days)
+      3. Safety-valve overflow (only if remaining > target_max):
+         3a. oldest killed=1 subagents of active auto roots
+         3b. oldest killed=0 idle subagents of auto roots
+         3c. last resort: oldest killed=1, then killed=0 idle subagents of policy.keep_roots
     """
     pol = policy or RetentionPolicy()
     now = time.time()
     idle_cutoff = now - pol.keep_idle_days * 86400
     root_cutoff = now - pol.root_active_days * 86400
+
+    keep_roots = set(pol.keep_roots)
+    archive_roots = set(pol.archive_roots)
+    keep_subagents = set(pol.keep_subagents)
 
     active_roots = {
         cid
@@ -56,11 +85,16 @@ def select_offload_subagents(
         if (row := state.summaries.get(cid)) and parse_iso_ts(row.last_modified_time) >= root_cutoff
     }
 
-    normal_offload: list[tuple[float, str]] = []
-    active_root_killed: list[tuple[float, str]] = []
-    protected_alive_idle: list[tuple[float, str]] = []
+    explicit_archive: list[tuple[float, str]] = []
+    auto_normal: list[tuple[float, str]] = []
+    auto_active_killed: list[tuple[float, str]] = []
+    auto_alive_idle: list[tuple[float, str]] = []
+    keep_killed: list[tuple[float, str]] = []
+    keep_alive: list[tuple[float, str]] = []
 
     for cid, row in state.subagents.items():
+        if cid in keep_subagents:
+            continue
         if row.not_fully_idle != 0 or row.status != "CASCADE_RUN_STATUS_IDLE":
             continue
         ts = parse_iso_ts(row.last_modified_time)
@@ -72,30 +106,47 @@ def select_offload_subagents(
         if now - ts < pol.recent_touch_guard_sec:
             continue
 
-        root_is_recent = resolve_root_id(state, cid) in active_roots
-        if row.killed == 0 and (root_is_recent or ts >= idle_cutoff):
-            protected_alive_idle.append((ts, cid))
-        elif row.killed == 1 and root_is_recent:
-            active_root_killed.append((ts, cid))
+        root_id = resolve_root_id(state, cid)
+        if root_id in archive_roots:
+            explicit_archive.append((ts, cid))
+        elif root_id in keep_roots:
+            (keep_killed if row.killed == 1 else keep_alive).append((ts, cid))
         else:
-            normal_offload.append((ts, cid))
+            root_is_recent = root_id in active_roots
+            if row.killed == 0 and (root_is_recent or ts >= idle_cutoff):
+                auto_alive_idle.append((ts, cid))
+            elif row.killed == 1 and root_is_recent:
+                auto_active_killed.append((ts, cid))
+            else:
+                auto_normal.append((ts, cid))
 
-    normal_offload.sort()
-    active_root_killed.sort()
-    protected_alive_idle.sort()
+    for bucket in (explicit_archive, auto_normal, auto_active_killed, auto_alive_idle, keep_killed, keep_alive):
+        bucket.sort()
 
-    tier1 = [cid for _, cid in normal_offload]
-    tier2: list[str] = []
-    tier3: list[str] = []
+    t_explicit = [cid for _, cid in explicit_archive]
+    t_normal = [cid for _, cid in auto_normal]
+    t_auto_killed: list[str] = []
+    t_auto_alive: list[str] = []
+    t_keep_overflow: list[str] = []
 
-    remaining = len(state.disk_dbs) - len(tier1)
+    remaining = len(state.disk_dbs) - len(t_explicit) - len(t_normal)
     if remaining > pol.target_max:
-        tier2 = [cid for _, cid in active_root_killed[: remaining - pol.target_max]]
-        remaining -= len(tier2)
+        t_auto_killed = [cid for _, cid in auto_active_killed[: remaining - pol.target_max]]
+        remaining -= len(t_auto_killed)
     if remaining > pol.target_max:
-        tier3 = [cid for _, cid in protected_alive_idle[: remaining - pol.target_max]]
+        t_auto_alive = [cid for _, cid in auto_alive_idle[: remaining - pol.target_max]]
+        remaining -= len(t_auto_alive)
+    if remaining > pol.target_max:
+        keep_pool = [cid for _, cid in keep_killed] + [cid for _, cid in keep_alive]
+        t_keep_overflow = keep_pool[: remaining - pol.target_max]
 
-    return tier1, tier2, tier3
+    return OffloadSelection(
+        explicit_archive=t_explicit,
+        auto_normal=t_normal,
+        auto_overflow_killed=t_auto_killed,
+        auto_overflow_alive=t_auto_alive,
+        keep_overflow=t_keep_overflow,
+    )
 
 
 def _export_lost_named_chats(cfg: VaultConfig, named_orphans: list[SummaryRow]) -> Path | None:
@@ -252,20 +303,22 @@ def plan_clean(
     """Read-only preview of Layer 2 offload and orphan-purge counts (no lock or offline gate)."""
     pol = policy or cfg.retention
     state = load_state(cfg)
-    tier1, tier2, tier3 = select_offload_subagents(state, pol)
-    offload_ids = tier1 + tier2 + tier3
+    sel = select_offload_subagents(state, pol)
+    offload_ids = sel.all_ids
     plan: dict[str, object] = {
         "total_dbs": len(state.disk_dbs),
         "protected_count": len(state.protected_on_disk),
         "offload_count": len(offload_ids),
         "projected_remaining": len(state.disk_dbs) - len(offload_ids),
-        "offload_inactive_root_subs": len(tier1),
-        "offload_active_root_killed_overflow": len(tier2),
-        "offload_alive_overflow": len(tier3),
+        "offload_archive_roots": len(sel.explicit_archive),
+        "offload_inactive_root_subs": len(sel.auto_normal),
+        "offload_active_root_killed_overflow": len(sel.auto_overflow_killed),
+        "offload_alive_overflow": len(sel.auto_overflow_alive),
+        "offload_keep_roots_overflow": len(sel.keep_overflow),
         "purge_named_orphans": len(state.named_root_orphans),
         "purge_child_orphans": len(state.other_orphans),
         "cli_rows_preserved": len(state.cli_orphans),
-        "policy": dataclasses.asdict(pol),
+        "policy": pol.to_dict(),
     }
     if include_ids:
         plan["offload_ids"] = offload_ids
@@ -290,8 +343,7 @@ def run_clean(
                 raise RuntimeError(f"Offline gate blocked clean: {gate_msg}")
 
         state = load_state(cfg)
-        tier1, tier2, tier3 = select_offload_subagents(state, pol)
-        offload_ids = tier1 + tier2 + tier3
+        offload_ids = select_offload_subagents(state, pol).all_ids
         non_cli_orphans = [r.cid for r in state.named_root_orphans] + [r.cid for r in state.other_orphans]
 
         if not offload_ids and not non_cli_orphans:

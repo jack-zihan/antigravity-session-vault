@@ -85,10 +85,30 @@ class TestCliAndWatcherE2E(unittest.TestCase):
         self.cfg.summary_pb.write_bytes(encode_field1_entry(root_id, b"R") + encode_field1_entry(sub_id, b"S"))
 
         # Read-only commands must NEVER create the log file or its parent directory.
-        for cmd in (("status",), ("search", "swarm"), ("clean", "--dry-run"), ("restore", "--list"), ("config",)):
+        for cmd in (
+            ("status",),
+            ("trees",),
+            ("trees", "--json"),
+            ("policy",),
+            ("search", "swarm"),
+            ("clean", "--dry-run"),
+            ("discard", "--root", root_id[:8]),
+            ("restore", "--list"),
+            ("config",),
+        ):
             r = self._run_cli(*cmd)
             self.assertEqual(r.returncode, 0, msg=f"{cmd} stderr={r.stderr}")
         self.assertFalse(self.cfg.log_file.parent.exists())
+
+        # Conversational curation via 8-char prefix: policy keep -> archive -> auto.
+        pol_keep = json.loads(self._run_cli("policy", "keep", root_id[:8]).stdout)
+        self.assertEqual(pol_keep["retention"]["keep_roots"], [root_id])
+        self.assertEqual(json.loads(self._run_cli("clean", "--dry-run").stdout)["offload_count"], 0)
+        pol_arch = json.loads(self._run_cli("policy", "archive", root_id[:8]).stdout)
+        self.assertEqual(pol_arch["retention"]["archive_roots"], [root_id])
+        self.assertEqual(pol_arch["retention"]["keep_roots"], [])
+        self.assertEqual(json.loads(self._run_cli("clean", "--dry-run").stdout)["offload_archive_roots"], 1)
+        self.assertEqual(self._run_cli("policy", "auto", root_id[:8]).returncode, 0)
 
         # clean --dry-run is concise by default; --verbose includes offload_ids.
         dry_brief = json.loads(self._run_cli("clean", "--dry-run").stdout)
@@ -135,6 +155,11 @@ class TestCliAndWatcherE2E(unittest.TestCase):
             clock["t"] += 20.0
             return clock["t"]
 
+        # Mutate config.json on disk AFTER watcher received initial cfg to verify hot-reload before clean.
+        updated_dict = self.cfg.to_dict()
+        updated_dict["retention"]["archive_roots"] = ["11111111-1111-1111-1111-111111111111"]
+        self.cfg_path.write_text(json.dumps(updated_dict), encoding="utf-8")
+
         with (
             mock.patch("session_vault.watcher.find_ls_and_main_agy", side_effect=lambda: next(ls_seq, (None, None))),
             mock.patch("session_vault.watcher.wait_pid_exit", return_value=True),
@@ -145,11 +170,13 @@ class TestCliAndWatcherE2E(unittest.TestCase):
             mock.patch("session_vault.store.verify_offline_gate", return_value=(True, "ok")),
             mock.patch("session_vault.archive.run_clean") as m_clean,
         ):
-            run_watch(self.cfg, log, shield_sec=120, backup_sec=1800, exit_after_clean=True)
+            run_watch(self.cfg, log, config_path=self.cfg_path, shield_sec=120, backup_sec=1800, exit_after_clean=True)
 
         m_shield.assert_called_once()
         m_backup.assert_called_once()
-        m_clean.assert_called_once_with(self.cfg, log, skip_gate=True)
+        reloaded_pol = m_clean.call_args.kwargs["policy"]
+        self.assertEqual(reloaded_pol.archive_roots, ("11111111-1111-1111-1111-111111111111",))
+        self.assertTrue(m_clean.call_args.kwargs["skip_gate"])
 
 
 if __name__ == "__main__":

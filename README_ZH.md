@@ -44,16 +44,19 @@ Antigravity Desktop 每次启动时都会对 `~/.gemini/antigravity/conversation
 - **Layer 2（`shield.py`、`archive.py`、`vault.py`）**：三层留存逻辑彼此解耦——在线 `mtime` 护盾、离线四级智能归档与双库清理、增量 WAL 安全主对话备份、归档检索与离线还原。
 - **Layer 3（`watcher.py`、`cli.py`、`scripts/hook.py`）**：事件驱动生命周期守护进程（拿锁后再按需加载重模块）、只读命令零日志副作用、快路径 Hook 入口（恒定返回 `{}`）。
 
-### 智能四级留存策略（默认规则）
+### 重要度优先 + 时间兜底与对话式审核
+
+时间长短不等于重要程度：5 天前的核心科研 Teamwork 过程往往比 2 小时前的一次性 Swarm 更有价值。插件支持在对话里直接用 `trees` + `policy` 按主对话重要性标注留存优先级：
 
 | 优先级 | 范围 | 处理方式 |
 |---|---|---|
-| **Priority 0（永不归档）** | 全部主对话、Side Question（`conversation_parents` + `annotations/*.pbtxt`）、置顶/标注对话、未建索引新对话、所有运行中/非空闲任务、近 5 分钟内活跃会话（`recent_touch_guard_sec = 300`） | 始终留在原位，并定期增量快照到保险库 |
-| **Priority 1（热子会话）** | 近 **2 天** 内活跃主对话名下未关闭（`killed == 0`）子会话，以及近 **3 天** 内活跃的未关闭子会话 | 留在原位不打断当前工作流 |
-| **Priority 2（常规冷归档）** | 超过 **2 天** 未活跃主对话名下的已结束/旧子会话 | 关闭 AGY 后按时间从旧到新无损归档 |
-| **安全阀（`target_max = 420`）** | 仅当上述归档后活跃总数仍高于 **420**（距 500 保留 80 余量）时触发 | 严格**只从最早的**已关闭（`killed == 1`）子会话开始归档，优先把最近几天跑的 Swarm / 子会话留在原位 |
+| **Priority 0（永不归档）** | 全部主对话、Side Question（`conversation_parents` + `annotations/*.pbtxt`）、置顶/标注对话、未建索引新对话、运行中任务、近 5 分钟内活跃会话，以及 `keep_subagents` 点名锁定的子会话（`restore` 还原的子会话会自动加入） | 始终留在原位；主对话与 Side Question 持续增量快照至保险库 |
+| **Tier 1（显式优先归档）** | 标记在 `archive_roots`（`policy archive <id>`）名下的已结束/空闲子会话 | 退出时最先无损归档，不受 2 天/3 天限制，立刻腾出配额 |
+| **Tier 2（默认时间归档）** | `auto` 组中超过 **2 天** 未活跃主对话名下的旧子会话 | 退出时按时间从旧到新无损归档 |
+| **Tier 3（安全阀 · `auto` 组）** | 仅当活跃总数仍高于 **`target_max = 420`** 时触发 | 优先从 `auto` 组归档最早的已关闭（`killed == 1`）子会话，其次是最早的空闲子会话 |
+| **Tier 4（受保护的 `keep_roots`）** | 标记在 `keep_roots`（`policy keep <id>`）的重要主对话整棵子会话树 | 无视 2 天过期限制优先留在原位；只有连 `keep_roots` 自身加起来都超 `420` 时，才按最旧优先归档其最早的死子会话 |
 
-被归档的子会话**无需重启 AGY 即可随时在线检索与读取**：插件自带 `rules/AGENTS.md`，任何 AGY Agent 找不到旧子会话时都会自动检索 `index.jsonl` 并直接读取完整 `transcript.jsonl`；如需把旧对话恢复回侧边栏，关闭 Desktop 后运行 `restore <uuid>` 即可一键还原。
+被归档的子会话**无需重启 AGY 即可随时在线检索与读取**；需要恢复回侧边栏时离线执行 `restore <uuid>`（自动加入 `keep_subagents` 避免下次退出又被踢出）；确认彻底不再需要的冷归档可显式执行 `discard --yes` 释放空间。
 
 ---
 
@@ -110,7 +113,10 @@ python3 -B -m session_vault config --init   # Windows: python -B -m session_vaul
     "target_max": 420,
     "root_active_days": 2,
     "keep_idle_days": 3,
-    "recent_touch_guard_sec": 300
+    "recent_touch_guard_sec": 300,
+    "keep_roots": [],
+    "archive_roots": [],
+    "keep_subagents": []
   },
   "watcher": {
     "shield_interval_sec": 120,
@@ -130,8 +136,11 @@ python3 -B -m session_vault config --init   # Windows: python -B -m session_vaul
 | 命令 | 可在 AGY 运行时执行？ | 说明 |
 |---|---|---|
 | `python -B -m session_vault status` | ✅ 可以（只读） | 查看活跃 DB 数、`PruneAll(500)` 风险模拟、守护进程状态、幽灵数与保险库统计 |
+| `python -B -m session_vault trees [--json] [--limit N]` | ✅ 可以（只读） | 按主对话汇总活跃/已归档子会话数量、体积与 `keep`/`archive`/`auto` 策略标签 |
+| `python -B -m session_vault policy [list \| keep \| archive \| auto <id...>] [--subagent]` | ✅ 可以 | 查看或调整主对话/子会话保留优先级（守护进程离线清理前自动热重读，无需重启） |
 | `python -B -m session_vault search [关键词] [--root <ID>] [--limit N]` | ✅ 可以（只读） | 在线检索 `index.jsonl` 并输出归档子会话的 `transcript.jsonl` 路径 |
 | `python -B -m session_vault clean --dry-run [--verbose] [--target-max N] [--root-active-days N] [--keep-idle-days N]` | ✅ 可以（只读） | 预览下次关闭 AGY 时的精简归档计划（加 `--verbose` 可附带完整 `offload_ids` 列表） |
+| `python -B -m session_vault discard [--root <ID> \| <cid...>] [--yes]` | ✅ 可以（`--yes` 删冷归档） | 预览或显式删除不再需要的冷归档子会话（绝不碰活跃 DB 或主对话保险库） |
 | `python -B -m session_vault shield` | ✅ 可以 | 手动执行第一层在线 `mtime` 护盾 |
 | `python -B -m session_vault backup` | ✅ 可以 | 手动执行第三层主对话 WAL 安全增量备份 |
 | `python -B -m session_vault ensure [--force]` | ✅ 可以 | 若守护进程未启动则按需拉起（`--force` 可在 AGY 未运行时强制拉起） |
